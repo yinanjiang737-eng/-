@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -e
 cd "$(dirname "$0")"
-./main
+g++ -std=c++17 -O2 -pipe main.cpp -o main
