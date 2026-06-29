@@ -1,35 +1,235 @@
 import sys
-from typing import List, Tuple, Dict, Optional
+from bisect import bisect_right
+from typing import List, Tuple, Optional, Dict
 
-# ===================== 数据结构定义 完全匹配文档 =====================
+
+# 正式提交时保持 False，避免产生额外耗时或输出
+DEBUG = False
+
+
 class Server:
+    """
+    使用区间资源表维护服务器占用情况。
+
+    blocks 中的每个元素为：
+        [start, end, used_gpu, used_cpu, used_mem]
+
+    表示半开区间 [start, end) 内服务器资源占用恒定。
+    任务运行区间 [t_i, t_i + p_i - 1] 等价于半开区间 [t_i, t_i + p_i)。
+    """
+    #限制服务器只能有这些属性
+    __slots__ = (
+        "sid",
+        "g_total",
+        "vg_single",
+        "c_total",
+        "r_total",
+        "blocks",
+        "ends",
+    )
+
     def __init__(self, sid: int, g_total: int, vg_single: int, c_total: int, r_total: int):
-        self.sid = sid          # 服务器编号 1~M
-        self.g_total = g_total  # GPU总数量 G_s
-        self.vg_single = vg_single  # 单卡显存 VG_s
-        self.c_total = c_total  # CPU总核数 C_s
-        self.r_total = r_total  # 总内存 R_s
-        # key:离散时间t, value:(已占用GPU,已占用CPU,已占用内存)
-        self.used: Dict[int, Tuple[int, int, int]] = {}
+        self.sid = sid   #服务器编号
+        self.g_total = g_total  #服务器有多少gpu
+        self.vg_single = vg_single #gpu显存大小
+        self.c_total = c_total  #cpu核数
+        self.r_total = r_total  #内存总量
 
-    # 获取指定时间t空闲资源
-    def get_free(self, t: int) -> Tuple[int, int, int]:
-        g_used, c_used, m_used = self.used.get(t, (0, 0, 0))
-        free_g = self.g_total - g_used
-        free_c = self.c_total - c_used
-        free_m = self.r_total - m_used
-        return free_g, free_c, free_m
+        # 有资源占用的区间。没有出现在 blocks 中的时间段，表示资源占用为 0。
+        self.blocks: List[List[int]] = []
 
-    # 占用连续时间片 [t_start, t_end] 资源
-    def occupy_resource(self, t_start: int, t_end: int, u_gpu: int, req_c: int, req_m: int):
-        for t in range(t_start, t_end + 1):
-            g_old, c_old, m_old = self.used.get(t, (0, 0, 0))
-            self.used[t] = (g_old + u_gpu, c_old + req_c, m_old + req_m)
+        # blocks 的 end 列，用于二分快速定位第一个 end > t 的区间。
+        self.ends: List[int] = []
+
+    def _rebuild_ends(self) -> None:
+        self.ends = [b[1] for b in self.blocks]
+
+    def find_window(
+        self,
+        req_gpu: int,
+        req_cpu: int,
+        req_mem: int,
+        earliest_t: int,
+        duration: int,
+    ) -> int:
+        """
+        找到从 earliest_t 开始，能够连续运行 duration 个时间单位的最早开始时间。
+
+        关键优化：
+        若某个已有占用区间资源不足，则当前窗口以及所有与该不足区间相交的起点都不可能合法，
+        因此直接跳到该不足区间的 end，而不是 current_t += 1。
+        """
+
+        t = earliest_t
+
+        blocks = self.blocks
+        ends = self.ends
+        g_total = self.g_total
+        c_total = self.c_total
+        r_total = self.r_total
+
+        while True:
+            need_end = t + duration
+
+            # 找到第一个 end > t 的区间
+            idx = bisect_right(ends, t)
+
+            ok = True
+
+            while idx < len(blocks):
+                b_start, b_end, used_g, used_c, used_m = blocks[idx]
+
+                # 后续区间已经在目标窗口之后，不影响当前窗口
+                if b_start >= need_end:
+                    break
+
+                # 理论上 bisect 后不会出现，但保留用于稳妥
+                if b_end <= t:
+                    idx += 1
+                    continue
+
+                # 当前已有占用区间与 [t, need_end) 相交，检查资源是否够
+                if (
+                    used_g + req_gpu > g_total
+                    or used_c + req_cpu > c_total
+                    or used_m + req_mem > r_total
+                ):
+                    # 跳过整个资源不足区间
+                    t = b_end
+                    ok = False
+                    break
+
+                idx += 1
+
+            if ok:
+                return t
+
+    def occupy_resource(
+        self,
+        start: int,
+        end: int,
+        add_gpu: int,
+        add_cpu: int,
+        add_mem: int,
+    ) -> None:
+        """
+        在半开区间 [start, end) 上增加资源占用。
+        """
+
+        old_blocks = self.blocks
+        new_blocks: List[List[int]] = []
+
+        cur = start
+
+        for block in old_blocks:
+            b_start, b_end, used_g, used_c, used_m = block
+
+            # 当前旧区间完全在新增区间左侧
+            if b_end <= start:
+                new_blocks.append(block)
+                continue
+
+            # 当前旧区间完全在新增区间右侧
+            if b_start >= end:
+                if cur < end:
+                    new_blocks.append([cur, end, add_gpu, add_cpu, add_mem])
+                    cur = end
+
+                new_blocks.append(block)
+                continue
+
+            # 当前旧区间与新增区间有交集
+
+            # 旧区间左侧未被新增区间覆盖的部分，保持原占用
+            if b_start < start:
+                new_blocks.append([b_start, start, used_g, used_c, used_m])
+
+            overlap_left = max(b_start, start)
+
+            # 如果新增区间中有一段落在空白区间，补上新增占用
+            if cur < overlap_left:
+                new_blocks.append([cur, overlap_left, add_gpu, add_cpu, add_mem])
+                cur = overlap_left
+
+            overlap_right = min(b_end, end)
+
+            # 交集部分叠加占用
+            if overlap_left < overlap_right:
+                new_blocks.append(
+                    [
+                        overlap_left,
+                        overlap_right,
+                        used_g + add_gpu,
+                        used_c + add_cpu,
+                        used_m + add_mem,
+                    ]
+                )
+                cur = overlap_right
+
+            # 旧区间右侧未被新增区间覆盖的部分，保持原占用
+            if b_end > end:
+                if cur < end:
+                    new_blocks.append([cur, end, add_gpu, add_cpu, add_mem])
+                    cur = end
+
+                new_blocks.append([end, b_end, used_g, used_c, used_m])
+                cur = end
+
+        # 新增区间右侧剩余部分
+        if cur < end:
+            new_blocks.append([cur, end, add_gpu, add_cpu, add_mem])
+
+        # 合并相邻且资源占用完全相同的区间，减少 blocks 数量
+        merged: List[List[int]] = []
+
+        for b in new_blocks:
+            if b[0] >= b[1]:
+                continue
+
+            if (
+                merged
+                and merged[-1][1] == b[0]
+                and merged[-1][2] == b[2]
+                and merged[-1][3] == b[3]
+                and merged[-1][4] == b[4]
+            ):
+                merged[-1][1] = b[1]
+            else:
+                merged.append(b)
+
+        self.blocks = merged
+        self._rebuild_ends()
 
 
 class Job:
-    def __init__(self, jid: int, release_t: int, proc_len: int, g_req: int, v_req: int, c_req: int, m_req: int, weight: int):
-        # 任务原始需求 Job_i = (r_i,p_i,g_i,v_i,c_i,m_i,w_i)
+    __slots__ = (
+        "jid",
+        "release_t",
+        "proc_len",
+        "g_req",
+        "v_req",
+        "c_req",
+        "m_req",
+        "weight",
+        "sid",
+        "t_start",
+        "u",
+        "f_finish",
+        "candidates",
+        "compat_cnt",
+    )
+
+    def __init__(
+        self,
+        jid: int,
+        release_t: int,
+        proc_len: int,
+        g_req: int,
+        v_req: int,
+        c_req: int,
+        m_req: int,
+        weight: int,
+    ):
         self.jid = jid
         self.release_t = release_t
         self.proc_len = proc_len
@@ -38,163 +238,360 @@ class Job:
         self.c_req = c_req
         self.m_req = m_req
         self.weight = weight
-        # 调度输出 Schedule_i = (i,s_i,t_i,u_i,F_i)
-        self.sid: int = -1
-        self.t_start: int = -1
-        self.u: int = -1
-        self.f_finish: int = -1
 
-# ===================== 输入解析模块 严格匹配文档输入格式 =====================
+        # 调度结果
+        self.sid = -1
+        self.t_start = -1
+        self.u = -1
+        self.f_finish = -1
+
+        # 候选服务器：
+        # (server, valid_u, memory_waste, server_gpu_memory, cpu_waste, mem_waste)
+        self.candidates: List[Tuple[Server, int, int, int, int, int]] = []
+        self.compat_cnt = 0
+
+
 def read_standard_input() -> Tuple[List[Server], List[Job]]:
-    all_nums = list(map(int, sys.stdin.read().split()))
+    data = list(map(int, sys.stdin.buffer.read().split()))
+
+    if not data:
+        return [], []
+
     ptr = 0
-    server_cnt = all_nums[ptr]
-    job_cnt = all_nums[ptr + 1]
+
+    server_cnt = data[ptr]
+    job_cnt = data[ptr + 1]
     ptr += 2
 
-    server_list: List[Server] = []
+    servers: List[Server] = []
+
     for sid in range(1, server_cnt + 1):
-        g_total = all_nums[ptr]
-        vg_single = all_nums[ptr + 1]
-        c_total = all_nums[ptr + 2]
-        r_total = all_nums[ptr + 3]
+        g_total = data[ptr]
+        vg_single = data[ptr + 1]
+        c_total = data[ptr + 2]
+        r_total = data[ptr + 3]
         ptr += 4
-        server_list.append(Server(sid, g_total, vg_single, c_total, r_total))
 
-    job_list: List[Job] = []
+        servers.append(Server(sid, g_total, vg_single, c_total, r_total))
+
+    jobs: List[Job] = []
+
     for jid in range(1, job_cnt + 1):
-        release_t = all_nums[ptr]
-        proc_len = all_nums[ptr + 1]
-        g_req = all_nums[ptr + 2]
-        v_req = all_nums[ptr + 3]
-        c_req = all_nums[ptr + 4]
-        m_req = all_nums[ptr + 5]
-        weight = all_nums[ptr + 6]
+        release_t = data[ptr]
+        proc_len = data[ptr + 1]
+        g_req = data[ptr + 2]
+        v_req = data[ptr + 3]
+        c_req = data[ptr + 4]
+        m_req = data[ptr + 5]
+        weight = data[ptr + 6]
         ptr += 7
-        job_list.append(Job(jid, release_t, proc_len, g_req, v_req, c_req, m_req, weight))
-    return server_list, job_list
 
-# ===================== 调度辅助工具函数 =====================
-# 判断服务器能否承载任务，返回满足条件的最小u；不兼容返回None
+        jobs.append(
+            Job(
+                jid,
+                release_t,
+                proc_len,
+                g_req,
+                v_req,
+                c_req,
+                m_req,
+                weight,
+            )
+        )
+
+    return servers, jobs
+
+
 def get_min_valid_u(server: Server, job: Job) -> Optional[int]:
-    # CPU、内存单台上限校验
+    """
+    计算任务在某服务器上的最小合法 GPU 分配数量 u。
+
+    约束：
+        u >= g_i
+        u <= G_s
+        v_i <= u * VG_s
+        c_i <= C_s
+        m_i <= R_s
+    """
+
     if job.c_req > server.c_total or job.m_req > server.r_total:
         return None
-    # 遍历合法u区间 [g, G]，取最小满足显存需求
-    for u_candidate in range(job.g_req, server.g_total + 1):
-        if job.v_req <= u_candidate * server.vg_single:
-            return u_candidate
+
+    # 满足显存需求需要的最少 GPU 数
+    u_by_memory = (job.v_req + server.vg_single - 1) // server.vg_single
+
+    valid_u = max(job.g_req, u_by_memory)
+
+    if valid_u <= server.g_total:
+        return valid_u
+
     return None
 
-# 查找服务器上从earliest_t开始，连续duration时长全部空闲的最早起始时间
-def find_continuous_time_window(
-    s: Server,
-    req_u: int,
-    req_c: int,
-    req_m: int,
-    earliest_t: int,
-    duration: int
-) -> int:
-    current_t = earliest_t
-    while True:
-        window_ok = True
-        for delta in range(duration):
-            t = current_t + delta
-            fg, fc, fm = s.get_free(t)
-            if fg < req_u or fc < req_c or fm < req_m:
-                window_ok = False
-                break
-        if window_ok:
-            return current_t
-        current_t += 1
 
-# ===================== 核心调度算法（贪心：高优先级任务优先） =====================
-def run_scheduler(servers: List[Server], jobs: List[Job]):
-    # 按优先级权重降序，高weight任务先分配
-    sorted_jobs = sorted(jobs, key=lambda x: -x.weight)
-    for job in sorted_jobs:
-        best_start_t = float('inf')
-        best_server: Optional[Server] = None
-        best_u = -1
+def prepare_candidates(servers: List[Server], jobs: List[Job]) -> None:
+    """
+    预处理每个任务能够使用的服务器。
+    任务与服务器是否兼容只与资源上限有关，与时间无关，因此提前计算。
+    """
 
-        # 遍历所有服务器，寻找最优部署机器
-        for s in servers:
-            valid_u = get_min_valid_u(s, job)
+    for job in jobs:
+        candidates: List[Tuple[Server, int, int, int, int, int]] = []
+
+        for server in servers:
+            valid_u = get_min_valid_u(server, job)
+
             if valid_u is None:
                 continue
-            # 寻找最早可用启动时间
-            start_t = find_continuous_time_window(s, valid_u, job.c_req, job.m_req, job.release_t, job.proc_len)
-            if start_t < best_start_t:
-                best_start_t = start_t
-                best_server = s
-                best_u = valid_u
 
-        # 分配调度结果
+            memory_waste = valid_u * server.vg_single - job.v_req
+            server_gpu_memory = server.g_total * server.vg_single
+            cpu_waste = server.c_total - job.c_req
+            mem_waste = server.r_total - job.m_req
+
+            candidates.append(
+                (
+                    server,
+                    valid_u,
+                    memory_waste,
+                    server_gpu_memory,
+                    cpu_waste,
+                    mem_waste,
+                )
+            )
+
+        # 候选服务器排序：
+        # 1. 显存浪费少
+        # 2. 使用 GPU 数少
+        # 3. CPU 浪费少
+        # 4. 内存浪费少
+        # 5. 服务器 GPU 总显存小，尽量把小任务放小机器，保留大机器
+        # 6. 服务器编号小，保证结果稳定
+        candidates.sort(
+            key=lambda x: (
+                x[2],
+                x[1],
+                x[4],
+                x[5],
+                x[3],
+                x[0].sid,
+            )
+        )
+
+        job.candidates = candidates
+        job.compat_cnt = len(candidates)
+
+
+def job_sort_key(job: Job) -> Tuple[int, int, int, int, int, int]:
+    """
+    任务排序策略。
+
+    主要思想：
+    1. 先安排兼容服务器少的瓶颈任务，避免后续无处可放；
+    2. 单位时间权重高的任务优先，降低加权等待；
+    3. 提交时间早的任务优先；
+    4. 权重大、运行时间长的任务作为后续 tie-break。
+    """
+
+    # 避免浮点数，扩大 1000000 倍后做整数比较
+    weight_density = job.weight * 1000000 // job.proc_len
+
+    return (
+        job.compat_cnt,
+        -weight_density,
+        job.release_t,
+        -job.weight,
+        -job.proc_len,
+        job.jid,
+    )
+
+
+def run_scheduler(servers: List[Server], jobs: List[Job]) -> None:
+    if not jobs:
+        return
+
+    prepare_candidates(servers, jobs)
+
+    sorted_jobs = sorted(jobs, key=job_sort_key)
+
+    for job in sorted_jobs:
+        best_key = None
+        best_server: Optional[Server] = None
+        best_u = -1
+        best_start_t = -1
+
+        for (
+            server,
+            valid_u,
+            memory_waste,
+            server_gpu_memory,
+            cpu_waste,
+            mem_waste,
+        ) in job.candidates:
+
+            start_t = server.find_window(
+                valid_u,
+                job.c_req,
+                job.m_req,
+                job.release_t,
+                job.proc_len,
+            )
+
+            candidate_key = (
+                start_t,            # 第一目标：开始越早越好
+                memory_waste,       # 第二目标：显存碎片越少越好
+                valid_u,            # 第三目标：占用 GPU 数越少越好
+                cpu_waste,          # 第四目标：CPU 资源越贴合越好
+                mem_waste,          # 第五目标：内存资源越贴合越好
+                server_gpu_memory,  # 第六目标：尽量保留大显存机器
+                server.sid,         # 稳定输出
+            )
+
+            if best_key is None or candidate_key < best_key:
+                best_key = candidate_key
+                best_server = server
+                best_u = valid_u
+                best_start_t = start_t
+
+            # 如果已经能在 release_t 启动，由于候选服务器已按碎片度排序，
+            # 后面的服务器不可能获得更早开始时间，因此可以提前结束搜索。
+            if start_t == job.release_t:
+                break
+
+        # 输入保证每个任务至少可以在某台服务器上单独运行，因此 best_server 正常不会为 None。
+        if best_server is None:
+            raise RuntimeError("No feasible server found for job {}".format(job.jid))
+
         job.sid = best_server.sid
         job.t_start = best_start_t
         job.u = best_u
         job.f_finish = best_start_t + job.proc_len
-        # 修复报错：原代码t_start未定义，替换为best_start_t
-        t_end = best_start_t + job.proc_len - 1
-        best_server.occupy_resource(best_start_t, t_end, best_u, job.c_req, job.m_req)
 
-# ===================== 全局约束校验函数（对标评测合法性检测） =====================
+        best_server.occupy_resource(
+            best_start_t,
+            best_start_t + job.proc_len,
+            best_u,
+            job.c_req,
+            job.m_req,
+        )
+
+
 def check_all_constraints(servers: List[Server], jobs: List[Job]) -> bool:
-    # 约束1：任务无重复、无遗漏
-    jid_set = set()
-    for j in jobs:
-        if j.jid in jid_set:
-            return False
-        jid_set.add(j.jid)
-    if len(jid_set) != len(jobs):
-        return False
+    """
+    本地调试用合法性检查。
+    正式提交时 DEBUG=False，不会执行此函数。
+    """
+
+    if not jobs:
+        return True
+
+    server_map: Dict[int, Server] = {s.sid: s for s in servers}
+
+    seen = set()
+
+    # 用事件扫描检查每台服务器的并发资源是否超限
+    events: Dict[int, List[Tuple[int, int, int, int]]] = {
+        s.sid: [] for s in servers
+    }
 
     for job in jobs:
-        # 找到对应服务器
-        target_s = None
-        for s in servers:
-            if s.sid == job.sid:
-                target_s = s
-                break
-        if target_s is None:
+        if job.jid in seen:
+            return False
+        seen.add(job.jid)
+
+        server = server_map.get(job.sid)
+
+        if server is None:
             return False
 
-        # 约束2：t_i >= r_i
         if job.t_start < job.release_t:
             return False
 
-        # 约束4：F_i = t_i + p_i
         if job.f_finish != job.t_start + job.proc_len:
             return False
 
-        # 约束5：u范围、显存、单机CPU/内存上限
-        if not (job.g_req <= job.u <= target_s.g_total):
-            return False
-        if job.v_req > job.u * target_s.vg_single:
-            return False
-        if job.c_req > target_s.c_total or job.m_req > target_s.r_total:
+        if not (job.g_req <= job.u <= server.g_total):
             return False
 
-        # 约束3、6：连续运行、服务器并发资源不超限
-        t_end = job.t_start + job.proc_len - 1
-        for t in range(job.t_start, t_end + 1):
-            g_use, c_use, m_use = target_s.used[t]
-            if g_use > target_s.g_total or c_use > target_s.c_total or m_use > target_s.r_total:
+        if job.v_req > job.u * server.vg_single:
+            return False
+
+        if job.c_req > server.c_total or job.m_req > server.r_total:
+            return False
+
+        events[job.sid].append((job.t_start, job.u, job.c_req, job.m_req))
+        events[job.sid].append((job.f_finish, -job.u, -job.c_req, -job.m_req))
+
+    if len(seen) != len(jobs):
+        return False
+
+    for server in servers:
+        server_events = events[server.sid]
+        server_events.sort()
+
+        used_g = 0
+        used_c = 0
+        used_m = 0
+
+        idx = 0
+
+        while idx < len(server_events):
+            current_t = server_events[idx][0]
+
+            # 同一时刻的开始和结束事件一起处理。
+            # 因为区间是 [start, finish)，finish 时刻资源已经释放。
+            while idx < len(server_events) and server_events[idx][0] == current_t:
+                _, delta_g, delta_c, delta_m = server_events[idx]
+                used_g += delta_g
+                used_c += delta_c
+                used_m += delta_m
+                idx += 1
+
+            if used_g < 0 or used_c < 0 or used_m < 0:
                 return False
+
+            if (
+                used_g > server.g_total
+                or used_c > server.c_total
+                or used_m > server.r_total
+            ):
+                return False
+
     return True
 
-# ===================== 标准输出模块（严格匹配输出格式） =====================
-def output_result(jobs: List[Job]):
-    # 按任务编号升序输出，无多余文字、空行
-    jobs_sorted = sorted(jobs, key=lambda x: x.jid)
-    for j in jobs_sorted:
-        print(f"{j.jid} {j.sid} {j.t_start} {j.u} {j.f_finish}")
 
-# ===================== 程序入口 =====================
+def output_result(jobs: List[Job]) -> None:
+    jobs_sorted = sorted(jobs, key=lambda x: x.jid)
+
+    out_lines = []
+
+    for job in jobs_sorted:
+        out_lines.append(
+            "{} {} {} {} {}".format(
+                job.jid,
+                job.sid,
+                job.t_start,
+                job.u,
+                job.f_finish,
+            )
+        )
+
+    sys.stdout.write("\n".join(out_lines))
+
+
+def main() -> None:
+    servers, jobs = read_standard_input()
+
+    if not servers and not jobs:
+        return
+
+    run_scheduler(servers, jobs)
+
+    if DEBUG:
+        if not check_all_constraints(servers, jobs):
+            raise RuntimeError("Generated schedule violates constraints!")
+
+    output_result(jobs)
+
+
 if __name__ == "__main__":
-    server_arr, job_arr = read_standard_input()
-    run_scheduler(server_arr, job_arr)
-    # 合法性校验，非法直接抛出异常
-    if not check_all_constraints(server_arr, job_arr):
-        raise RuntimeError("Generated schedule violates constraints!")
-    output_result(job_arr)
+    main()
